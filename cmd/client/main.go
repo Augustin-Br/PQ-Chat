@@ -57,9 +57,20 @@ func main() {
 
 	fmt.Printf("Handshake done. \nShared Secret starts with: %x\n", sharedSecret[:4])
 
+	// =======================
+	// 2. SETUP SECURE SESSION
+	// =======================
+
+	session, err := crypto.NewSecureSession(sharedSecret)
+	if err != nil {
+		fmt.Println("Failed to create secure session:", err)
+		return
+	}
+
 	// ================
-	// 2. START CHAT
+	// 3. START CHAT
 	// ================
+
 	reader := bufio.NewReader(os.Stdin)
 
 	fmt.Print("Enter your username: ")
@@ -68,8 +79,8 @@ func main() {
 
 	fmt.Print("> ")
 
-	// Launch the receiving goroutine using the EXISTING decoder
-	go receiveMessages(decoder)
+	// Launch the receiving goroutine, passing the secure session
+	go receiveMessages(decoder, session)
 
 	for {
 		input, _ := reader.ReadString('\n')
@@ -80,11 +91,14 @@ func main() {
 			continue
 		}
 
-		// Create the structured message
+		// Encrypt the user input
+		encryptedPayload := session.Encrypt([]byte(input))
+
+		// Create the structured message with the Base64 encoded ciphertext
 		msg := network.Message{
 			Type:    "chat",
 			Sender:  username,
-			Payload: input,
+			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
 		}
 
 		// Encode and send the message in one step
@@ -97,8 +111,9 @@ func main() {
 	}
 }
 
-// receiveMessages runs in the background and listens for incoming server broadcasts
-func receiveMessages(decoder *json.Decoder) {
+// receiveMessages runs in the background and listens for incoming server broadcasts.
+// It uses the secure session to authenticate and decrypt incoming messages.
+func receiveMessages(decoder *json.Decoder, session *crypto.SecureSession) {
 
 	for {
 		var msg network.Message
@@ -107,7 +122,22 @@ func receiveMessages(decoder *json.Decoder) {
 			os.Exit(0)
 		}
 
-		// Print the received message
-		fmt.Printf("\r[%s] %s: %s\n> ", msg.Type, msg.Sender, msg.Payload)
+		// 1. Decode the Base64 payload back to raw encrypted bytes
+		ciphertext, err := base64.StdEncoding.DecodeString(msg.Payload)
+		if err != nil {
+			fmt.Printf("\r[Warning] Failed to decode base64 payload from %s: %v\n> ", msg.Sender, err)
+			continue // Skip this message and wait for the next one
+		}
+
+		// 2. Decrypt and authenticate the payload
+		plaintext, err := session.Decrypt(ciphertext)
+		if err != nil {
+			// If decryption fails, it could be tampering, replay attack, or wrong key!
+			fmt.Printf("\r[Warning] Decryption failed for message from %s: %v\n> ", msg.Sender, err)
+			continue
+		}
+
+		// 3. Print the authentic, decrypted message
+		fmt.Printf("\r[%s] %s: %s\n> ", msg.Type, msg.Sender, string(plaintext))
 	}
 }

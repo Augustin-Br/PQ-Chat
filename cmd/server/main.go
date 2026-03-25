@@ -12,7 +12,12 @@ import (
 	"pq-chat/internal/network"
 )
 
-var clients = make(map[net.Conn]bool)
+type Client struct {
+	Session  *crypto.SecureSession
+	Username string
+}
+
+var clients = make(map[net.Conn]*Client)
 
 var mutex = &sync.Mutex{}
 
@@ -85,11 +90,24 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Printf("Handshake done\n Shared Secret starts with: %x\n", sharedSecret[:4])
 
-	// ============================
-	// 2. CHAT ROOM REGISTRATION
-	// ============================
+	// ========
+	// 2. CHAT
+	// ========
+
+	session, err := crypto.NewSecureSession(sharedSecret)
+	if err != nil {
+		fmt.Println("Failed to create session:", err)
+		return
+	}
+
+	// Create the Client object. Username is empty initially.
+	clientData := &Client{
+		Session:  session,
+		Username: "",
+	}
+
 	mutex.Lock()
-	clients[conn] = true
+	clients[conn] = clientData
 	mutex.Unlock()
 
 	defer func() {
@@ -98,14 +116,44 @@ func handleConnection(conn net.Conn) {
 		mutex.Unlock()
 	}()
 
-	// Normal chat loop (same as before)
+	// Normal chat loop
 	for {
 		var msg network.Message
 		if err := decoder.Decode(&msg); err != nil {
 			fmt.Printf("Client %s disconnected.\n", conn.RemoteAddr())
 			return
 		}
-		fmt.Printf("[%s] Received from %s (%s): %s\n", msg.Type, msg.Sender, conn.RemoteAddr(), msg.Payload)
+
+		// 1. Decode the incoming Base64 payload
+		ciphertext, err := base64.StdEncoding.DecodeString(msg.Payload)
+		if err != nil {
+			fmt.Printf("Warning: failed to decode base64 from %s: %v\n", conn.RemoteAddr(), err)
+			continue
+		}
+
+		// 2. Decrypt the message using THIS client's secure session
+		plaintext, err := session.Decrypt(ciphertext)
+		if err != nil {
+			fmt.Printf("Warning: decryption failed for %s: %v\n", conn.RemoteAddr(), err)
+			continue
+		}
+
+		// 3. Replace the payload with the actual plaintext
+		msg.Payload = string(plaintext)
+
+		// =================
+		// 4. ANTI-SPOOFING
+		// =================
+		if clientData.Username == "" {
+			clientData.Username = msg.Sender
+			fmt.Printf("Registered new user: %s (%s)\n", clientData.Username, conn.RemoteAddr())
+		} else {
+			msg.Sender = clientData.Username
+		}
+
+		fmt.Printf("[%s] Decrypted from %s (%s): %s\n", msg.Type, msg.Sender, conn.RemoteAddr(), msg.Payload)
+
+		// 5. Broadcast the PLAINTEXT message
 		broadcast(conn, msg)
 	}
 }
@@ -114,10 +162,20 @@ func broadcast(sender net.Conn, message network.Message) {
 	mutex.Lock()
 	defer mutex.Unlock()
 
-	for client := range clients {
-		if client != sender {
-			encoder := json.NewEncoder(client)
-			encoder.Encode(message)
+	// clientData is of type *Client
+	for clientConn, clientData := range clients {
+		if clientConn != sender {
+			msgToSend := message
+
+			// We access the Encrypt method through the Session field of the Client struct
+			encryptedPayload := clientData.Session.Encrypt([]byte(message.Payload))
+
+			msgToSend.Payload = base64.StdEncoding.EncodeToString(encryptedPayload)
+
+			encoder := json.NewEncoder(clientConn)
+			if err := encoder.Encode(msgToSend); err != nil {
+				fmt.Printf("Error sending message to %s: %v\n", clientConn.RemoteAddr(), err)
+			}
 		}
 	}
 }
