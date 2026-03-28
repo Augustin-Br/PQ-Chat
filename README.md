@@ -60,8 +60,6 @@ This project requires Go 1.24.4 or higher.
 
 Open a terminal and start the server, which will listen on port `:8080`:
 
-Bash
-
 ```bash
 go run cmd/server/main.go
 ```
@@ -69,8 +67,6 @@ go run cmd/server/main.go
 **2\. Start the Clients**
 
 Open one or multiple other terminals to start the clients:
-
-Bash
 
 ```bash
 go run cmd/client/main.go
