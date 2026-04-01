@@ -68,7 +68,7 @@ func main() {
 	}
 
 	// ================
-	// 3. START CHAT
+	// 3. START CHAT & E2E REGISTRATION
 	// ================
 
 	reader := bufio.NewReader(os.Stdin)
@@ -77,10 +77,37 @@ func main() {
 	username, _ := reader.ReadString('\n')
 	username = strings.TrimSpace(username)
 
+	fmt.Println("Generating your Post-Quantum E2EE Keys...")
+
+	e2ePubKey, e2ePrivKey, err := crypto.GenerateKeyPair()
+	if err != nil {
+		fmt.Println("Failed to generate E2E keys:", err)
+		return
+	}
+
+	regMsg := network.Message{
+		Type:    network.TypeE2ERegister,
+		Sender:  username,
+		Payload: base64.StdEncoding.EncodeToString(e2ePubKey),
+	}
+
+	encryptedRegPayload := session.Encrypt([]byte(regMsg.Payload))
+
+	regMsg.Payload = base64.StdEncoding.EncodeToString(encryptedRegPayload)
+
+	if err := encoder.Encode(regMsg); err != nil {
+		fmt.Printf("Failed to register E2E keys: %v\n", err)
+		return
+	}
+
+	fmt.Println("✅ E2EE Keys registered with the Server!")
+
 	fmt.Print("> ")
 
-	// Launch the receiving goroutine, passing the secure session
-	go receiveMessages(decoder, session)
+	e2eSessions := make(map[string]*crypto.SecureSession)
+	keyRespChan := make(chan []byte)
+
+	go receiveMessages(decoder, session, e2ePrivKey, e2eSessions, keyRespChan)
 
 	for {
 		input, _ := reader.ReadString('\n')
@@ -91,30 +118,86 @@ func main() {
 			continue
 		}
 
-		// Encrypt the user input
-		encryptedPayload := session.Encrypt([]byte(input))
+		if strings.HasPrefix(input, "/msg ") {
+			// ============================
+			// PRIVATE CHAT FLOW (E2EE)
+			// ============================
+			parts := strings.SplitN(input[5:], " ", 2)
+			if len(parts) < 2 {
+				fmt.Println("Usage: /msg <username> <message>")
+				fmt.Print("> ")
+				continue
+			}
+			targetUser := parts[0]
+			privateText := parts[1]
 
-		// Create the structured message with the Base64 encoded ciphertext
-		msg := network.Message{
-			Type:    "chat",
-			Sender:  username,
-			Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
+			targetSession, exists := e2eSessions[targetUser]
+			if !exists {
+				fmt.Printf("Requesting %s's Public Key from Server...\n", targetUser)
+
+				req := network.Message{
+					Type:   network.TypeE2EKeyReq,
+					Sender: username,
+					Target: targetUser,
+				}
+
+				encReq := session.Encrypt([]byte("req"))
+				req.Payload = base64.StdEncoding.EncodeToString(encReq)
+				encoder.Encode(req)
+
+				pubKey := <-keyRespChan
+				if len(pubKey) == 0 {
+					fmt.Println("Could not get key for user.")
+					continue
+				}
+
+				cipherText, sharedSecret, err := crypto.Encapsulate(pubKey)
+				if err != nil {
+					fmt.Println("E2E Setup failed:", err)
+					continue
+				}
+				targetSession, _ = crypto.NewSecureSession(sharedSecret)
+				e2eSessions[targetUser] = targetSession
+
+				initMsg := network.Message{
+					Type:    network.TypeE2ESessionInit,
+					Sender:  username,
+					Target:  targetUser,
+					Payload: base64.StdEncoding.EncodeToString(cipherText),
+				}
+				encInit := session.Encrypt([]byte(initMsg.Payload))
+				initMsg.Payload = base64.StdEncoding.EncodeToString(encInit)
+				encoder.Encode(initMsg)
+			}
+
+			encMsg := targetSession.Encrypt([]byte(privateText))
+			chatMsg := network.Message{
+				Type:    network.TypeE2EChat,
+				Sender:  username,
+				Target:  targetUser,
+				Payload: base64.StdEncoding.EncodeToString(encMsg),
+			}
+			encChatMsg := session.Encrypt([]byte(chatMsg.Payload))
+			chatMsg.Payload = base64.StdEncoding.EncodeToString(encChatMsg)
+			encoder.Encode(chatMsg)
+
+		} else {
+			// ============================
+			// GLOBAL CHAT FLOW (Standard)
+			// ============================
+			encryptedPayload := session.Encrypt([]byte(input))
+			msg := network.Message{
+				Type:    network.TypeChat,
+				Sender:  username,
+				Payload: base64.StdEncoding.EncodeToString(encryptedPayload),
+			}
+			encoder.Encode(msg)
 		}
-
-		// Encode and send the message in one step
-		if err := encoder.Encode(msg); err != nil {
-			fmt.Printf("Failed to send message: %v\n", err)
-			return
-		}
-
 		fmt.Print("> ")
 	}
 }
 
-// receiveMessages runs in the background and listens for incoming server broadcasts.
-// It uses the secure session to authenticate and decrypt incoming messages.
-func receiveMessages(decoder *json.Decoder, session *crypto.SecureSession) {
-
+func receiveMessages(decoder *json.Decoder, session *crypto.SecureSession, e2ePrivKey []byte, e2eSessions map[string]*crypto.SecureSession, keyRespChan chan []byte) {
 	for {
 		var msg network.Message
 		if err := decoder.Decode(&msg); err != nil {
@@ -122,22 +205,67 @@ func receiveMessages(decoder *json.Decoder, session *crypto.SecureSession) {
 			os.Exit(0)
 		}
 
-		// 1. Decode the Base64 payload back to raw encrypted bytes
 		ciphertext, err := base64.StdEncoding.DecodeString(msg.Payload)
 		if err != nil {
-			fmt.Printf("\r[Warning] Failed to decode base64 payload from %s: %v\n> ", msg.Sender, err)
-			continue // Skip this message and wait for the next one
-		}
-
-		// 2. Decrypt and authenticate the payload
-		plaintext, err := session.Decrypt(ciphertext)
-		if err != nil {
-			// If decryption fails, it could be tampering, replay attack, or wrong key!
-			fmt.Printf("\r[Warning] Decryption failed for message from %s: %v\n> ", msg.Sender, err)
 			continue
 		}
 
-		// 3. Print the authentic, decrypted message
-		fmt.Printf("\r[%s] %s: %s\n> ", msg.Type, msg.Sender, string(plaintext))
+		plaintext, err := session.Decrypt(ciphertext)
+		if err != nil {
+			continue
+		}
+
+		msg.Payload = string(plaintext)
+
+		switch msg.Type {
+		case network.TypeChat:
+			fmt.Printf("\r[Global] %s: %s\n> ", msg.Sender, msg.Payload)
+
+		case network.TypeE2EKeyResp:
+			pubKey, _ := base64.StdEncoding.DecodeString(msg.Payload)
+			keyRespChan <- pubKey
+
+		case network.TypeE2ESessionInit:
+			kyberCiphertext, err := base64.StdEncoding.DecodeString(msg.Payload)
+			if err != nil {
+				continue
+			}
+
+			sharedSecret, err := crypto.Decapsulate(e2ePrivKey, kyberCiphertext)
+			if err != nil {
+				fmt.Printf("\r[Error] Failed to decapsulate session from %s\n> ", msg.Sender)
+				continue
+			}
+
+			e2eSession, err := crypto.NewSecureSession(sharedSecret)
+			if err != nil {
+				continue
+			}
+
+			e2eSessions[msg.Sender] = e2eSession
+			fmt.Printf("\r[System] Secure E2E session established with %s!\n> ", msg.Sender)
+
+		case network.TypeE2EChat:
+			e2eSession, exists := e2eSessions[msg.Sender]
+			if !exists {
+				fmt.Printf("\r[Warning] Received E2E chat from %s but no session exists!\n> ", msg.Sender)
+				continue
+			}
+
+			encryptedPayload, err := base64.StdEncoding.DecodeString(msg.Payload)
+			if err != nil {
+				continue
+			}
+
+			decryptedText, err := e2eSession.Decrypt(encryptedPayload)
+			if err != nil {
+				fmt.Printf("\r[Warning] Failed to decrypt E2E message from %s\n> ", msg.Sender)
+				continue
+			}
+
+			fmt.Printf("\r[Private from %s]: %s\n> ", msg.Sender, string(decryptedText))
+
+		default:
+		}
 	}
 }

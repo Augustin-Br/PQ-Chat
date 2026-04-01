@@ -13,8 +13,9 @@ import (
 )
 
 type Client struct {
-	Session  *crypto.SecureSession
-	Username string
+	Session       *crypto.SecureSession
+	Username      string
+	E2EEPublicKey []byte
 }
 
 var clients = make(map[net.Conn]*Client)
@@ -153,8 +154,81 @@ func handleConnection(conn net.Conn) {
 
 		fmt.Printf("[%s] Decrypted from %s (%s): %s\n", msg.Type, msg.Sender, conn.RemoteAddr(), msg.Payload)
 
-		// 5. Broadcast the PLAINTEXT message
-		broadcast(conn, msg)
+		// =================
+		// 5. ROUTING LOGIC
+		// =================
+		switch msg.Type {
+		case network.TypeChat:
+			broadcast(conn, msg)
+
+		case network.TypeE2ERegister:
+			pubKey, err := base64.StdEncoding.DecodeString(msg.Payload)
+			if err != nil {
+				fmt.Printf("Failed to decode E2EE key from %s: %v\n", clientData.Username, err)
+				continue // Skip processing this message
+			}
+			clientData.E2EEPublicKey = pubKey
+			fmt.Printf("Registered E2EE Public Key for: %s\n", clientData.Username)
+
+		case network.TypeE2EKeyReq:
+			var targetPubKey []byte
+			mutex.Lock()
+			for _, c := range clients {
+				if c.Username == msg.Target {
+					targetPubKey = c.E2EEPublicKey
+					break
+				}
+			}
+			mutex.Unlock()
+
+			if targetPubKey != nil {
+				respMsg := network.Message{
+					Type:    network.TypeE2EKeyResp,
+					Sender:  "Server",
+					Target:  msg.Sender,
+					Payload: base64.StdEncoding.EncodeToString(targetPubKey),
+				}
+
+				// 1. Encrypt the payload using Alice's (the sender's) tunnel session
+				encryptedPayload := clientData.Session.Encrypt([]byte(respMsg.Payload))
+
+				// 2. Base64 encode the ciphertext
+				respMsg.Payload = base64.StdEncoding.EncodeToString(encryptedPayload)
+
+				// 3. Send it back to Alice!
+				if err := encoder.Encode(respMsg); err != nil {
+					fmt.Printf("Error sending key resp to %s: %v\n", clientData.Username, err)
+				}
+			} else {
+
+			}
+
+		case network.TypeE2ESessionInit, network.TypeE2EChat:
+
+			mutex.Lock()
+			for targetConn, targetClient := range clients {
+				if targetClient.Username == msg.Target {
+
+					// 1. Encrypt the E2E blob using the TARGET's outer tunnel session
+					encryptedPayload := targetClient.Session.Encrypt([]byte(msg.Payload))
+
+					// 2. Base64 encode the new payload
+					msg.Payload = base64.StdEncoding.EncodeToString(encryptedPayload)
+
+					// 3. Send it directly to the target
+					encoder := json.NewEncoder(targetConn)
+					if err := encoder.Encode(msg); err != nil {
+						fmt.Printf("Error routing E2E message to %s: %v\n", targetClient.Username, err)
+					}
+
+					break
+				}
+			}
+			mutex.Unlock()
+
+		default:
+			fmt.Printf("Unknown message type: %s\n", msg.Type)
+		}
 	}
 }
 
